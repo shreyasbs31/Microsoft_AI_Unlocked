@@ -202,6 +202,11 @@ The system uses **two separate Cosmos DB accounts** to serve different purposes:
 - `conversation-history` — Stores the rolling message window and compressed summaries.
 - `transparency-events` — Stores agent reasoning events for the dashboard to consume.
 
+**Partition key strategy:** All four containers use `session_id` as the partition key. This is critical for Cosmos DB performance — without correct partitioning, queries that filter by session_id become expensive cross-partition scans that explode RU consumption. With `session_id` as the partition key:
+- All reads and writes for a given session hit a single logical partition (single-digit millisecond latency).
+- No cross-partition queries are ever needed during active conversations.
+- The partition key has high cardinality (every session has a unique UUID), ensuring even data distribution across physical partitions.
+
 **Session document schema:**
 ```json
 {
@@ -294,6 +299,32 @@ Sandbox Warm Pool:
 6. If all pool containers are busy, the request is queued with a short timeout. If demand consistently exceeds pool capacity, a new container is provisioned (and later drained).
 
 **Why ACI over Container Apps for sandbox:** ACI provides stronger isolation guarantees (no shared runtime). Each pool container runs with read-only filesystem, outbound-internet-only networking (no internal Azure access), and no persistent storage. Even if a phishing site exploits Chromium, the blast radius is zero.
+
+**Pool health monitoring (heartbeat):**
+Each sandbox container exposes a `GET /health` endpoint. The Pool Manager sends a health check every **10 seconds** to each container:
+
+```python
+async def monitor_pool_health():
+    """Runs every 10 seconds in the Pool Manager."""
+    for container in sandbox_pool:
+        try:
+            resp = await http_client.get(
+                f"{container.endpoint}/health", timeout=3.0
+            )
+            if resp.status_code != 200:
+                raise HealthCheckFailed()
+            container.status = "IDLE" if not container.active_job else "BUSY"
+            container.last_healthy = time.time()
+        except (TimeoutError, ConnectionError, HealthCheckFailed):
+            container.consecutive_failures += 1
+            if container.consecutive_failures >= 3:  # 30 seconds of failure
+                log.warning(f"Container {container.id} unhealthy. Replacing.")
+                await destroy_container(container)
+                await spawn_replacement_container()
+                container.consecutive_failures = 0
+```
+
+**Why this matters:** Without health monitoring, a crashed container remains in the pool as "IDLE". The Pool Manager routes a job to it, the job fails, and the system must retry with the next container — adding 10+ seconds of unnecessary latency. With the heartbeat, unhealthy containers are replaced within 30 seconds, before any job is affected.
 
 **Cost trade-off:** Maintaining 2 warm containers costs ~$2-3/day at ACI pricing, which is negligible for a hackathon but eliminates the catastrophic 60-second cold-start latency.
 
@@ -673,7 +704,92 @@ kar sakta hoon? UPI se mujhe darr lagta hai."
 **Why this matters for the hackathon:**
 This internal exchange is the proof of genuine multi-agent collaboration. The Intelligence Agent **strategizes** and the Deception Agent **executes**. They are not operating independently — they are coordinating in real-time through a shared reasoning space. This is exactly what the "Agent Teamwork" track is looking for.
 
-**Persistence:** The group chat state is maintained throughout the session. When a new message arrives, the existing group chat is resumed (not recreated). This preserves the full context of the strategic conversation between agents.
+**Persistence: 3-Tier GroupChat State Recovery**
+
+The system runs on Azure Container Apps — a distributed serverless environment where requests may be routed to different container replicas, containers may scale down or restart at any time, and in-memory Python objects are not preserved across restarts. If the AutoGen GroupChat object only exists in RAM, a container restart or load-balancer reroute would destroy the active conversation state.
+
+**Solution: Hybrid 3-Tier State Persistence**
+
+The system does NOT serialize the entire AutoGen GroupChat object. Instead, it persists only the **conversation message history array** — a lightweight JSON structure that is sufficient to reconstruct the GroupChat from scratch:
+
+```json
+[
+  {"role": "user", "content": "Your SBI account will be blocked"},
+  {"role": "assistant", "name": "intelligence", "content": "Analysis: scam_type=bank_verification..."},
+  {"role": "assistant", "name": "deception", "content": "Oh no, kya hua? Mera account band hone wala hai?"}
+]
+```
+
+**Three storage tiers:**
+
+| Tier | Store | Latency | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Tier 1** | Local RAM (LRU cache) | ~0ms | Hot path: same container handles consecutive turns |
+| **Tier 2** | Azure Redis cache | ~1–2ms | Warm path: different container handles next turn |
+| **Tier 3** | Cosmos DB (conversation-history) | ~5–10ms | Cold path: container restarted or scaled from zero |
+
+**GroupChat restoration logic (on every incoming message):**
+
+```python
+async def restore_groupchat(session_id: str) -> GroupChat:
+    # Tier 1: Check local RAM cache
+    if session_id in ram_cache:
+        return ram_cache[session_id]
+    
+    # Tier 2: Check Redis
+    cached = await redis_client.get(f"groupchat:{session_id}")
+    if cached:
+        message_history = json.loads(cached)
+        groupchat = reconstruct_autogen_groupchat(message_history)
+        ram_cache[session_id] = groupchat  # Promote to Tier 1
+        return groupchat
+    
+    # Tier 3: Load from Cosmos DB (source of truth)
+    doc = await cosmos_client.read_item(
+        item=session_id, partition_key=session_id,
+        container="conversation-history"
+    )
+    message_history = doc["messages"]
+    groupchat = reconstruct_autogen_groupchat(message_history)
+    
+    # Promote to Tier 1 + Tier 2
+    ram_cache[session_id] = groupchat
+    await redis_client.setex(
+        f"groupchat:{session_id}", ttl=3600, value=json.dumps(message_history)
+    )
+    return groupchat
+```
+
+**Turn completion logic (after every agent response):**
+
+```python
+async def persist_groupchat(session_id: str, groupchat: GroupChat):
+    message_history = extract_message_history(groupchat)
+    
+    # Tier 1: Update RAM immediately
+    ram_cache[session_id] = groupchat
+    
+    # Tier 2: Update Redis synchronously (fast, ~1ms)
+    await redis_client.setex(
+        f"groupchat:{session_id}", ttl=3600, value=json.dumps(message_history)
+    )
+    
+    # Tier 3: Update Cosmos DB asynchronously (fire-and-forget)
+    asyncio.create_task(cosmos_client.upsert_item(
+        body={"session_id": session_id, "messages": message_history},
+        partition_key=session_id,
+        container="conversation-history"
+    ))
+```
+
+**RAM cache management:**
+- Implementation: LRU cache keyed by `session_id`.
+- Maximum capacity: 200 sessions (configurable via `GROUPCHAT_CACHE_SIZE`).
+- Eviction: Least-recently-used sessions are evicted when capacity is exceeded.
+- Redis TTL: 1 hour — entries auto-expire to prevent stale memory accumulation.
+- Cosmos DB: No TTL — serves as the permanent source of truth.
+
+**Performance impact:** The restoration overhead (Redis read + AutoGen reconstruction) adds only ~3–7ms to the worst case — negligible compared to LLM inference time (~2–4 seconds) and the artificial human latency delay (~2–12 seconds).
 
 #### Fast-Pass Routing (Latency Optimization)
 
@@ -1124,6 +1240,41 @@ Push structured JSON result as system message into GroupChat
 
 **Key architectural difference from synchronous approach:** The tool returns a `job_id` immediately rather than blocking the agent pipeline. The Intelligence Agent simultaneously instructs the Deception Agent to send a stalling message ("Okay, clicking the link now, mera internet slow hai...") while the sandbox processes in the background. When the sandbox completes, results are injected back into the GroupChat as a system message, triggering a second analysis-and-response cycle. This ensures the conversation **never stalls** for URL analysis.
 
+**⚠️ Async Callback Concurrency Trap:**
+
+When the sandbox finishes, it calls a **callback webhook** (`POST /sandbox/callback/{session_id}`) to push results back into the GroupChat. But what if the scammer sends another message at the exact millisecond the sandbox callback arrives? Two concurrent processes would attempt to modify the GroupChat state simultaneously, causing race conditions.
+
+**The fix:** The sandbox callback is treated **identically to an incoming scammer message** in the routing layer. It must:
+1. Acquire the **Redis session lock** (`lock:session:{session_id}`) before injecting results.
+2. If the lock is held (because a scammer message is currently being processed), the callback **waits** with the same retry logic as normal messages.
+3. Only after acquiring the lock does the callback inject the sandbox result as a system message and trigger the next agent reasoning cycle.
+4. The lock is released after the complete cycle (Intelligence analysis + Deception response) finishes.
+
+```python
+async def handle_sandbox_callback(session_id: str, sandbox_result: dict):
+    """Callback from sandbox container. Treated like an incoming message."""
+    lock = SessionLock(redis_client, session_id, ttl=60)
+    
+    if not lock.acquire(max_retries=20, retry_interval=0.5):
+        # If lock cannot be acquired after 10 seconds, enqueue for retry
+        await enqueue_retry("sandbox-callback", session_id, sandbox_result)
+        return
+    
+    try:
+        # Inject sandbox result as a system message into GroupChat
+        groupchat = await restore_groupchat(session_id)
+        groupchat.inject_system_message(
+            f"[Sandbox Analysis Complete]\n{json.dumps(sandbox_result)}"
+        )
+        
+        # Trigger Intelligence Agent to process result
+        await run_agent_cycle(groupchat, session_id)
+    finally:
+        lock.release()
+```
+
+This guarantees that sandbox callbacks and scammer messages **never overlap** in the same session.
+
 ### 8.2 OCR Tool Architecture (With Image Preprocessing)
 
 Messaging platforms deliver images in diverse formats — binary attachments, base64-encoded payloads, multipart form data — and in varying quality. Raw OCR on unprocessed images produces unreliable results. The pipeline includes a mandatory preprocessing stage.
@@ -1215,8 +1366,19 @@ The GraphUpdateTool does **not** block the agent pipeline. Graph writes are non-
 3. The entity data is published to an **Azure Service Bus topic** (`graph-updates`).
 4. A background worker (`rattrap-graph-worker`) consumes from this topic and:
    - Writes vertices and edges to **Cosmos DB for Apache Gremlin** using the Gremlin API.
-   - Example Gremlin write: `g.addV('upi_id').property('value', 'scammer@ybl').property('first_seen', '2026-03-04T12:30:00Z')`
-   - Checks for existing vertices (cross-session linking): `g.V().has('value', 'scammer@ybl')` — if found, creates a `cross_session` edge.
+   - Uses the **upsert pattern** to prevent duplicate vertices when multiple sessions reference the same entity (e.g., a shared mule account):
+     ```groovy
+     // Upsert: create vertex only if it doesn't exist, otherwise return existing
+     g.V().has('upi_id', 'value', 'scammer@ybl')
+       .fold()
+       .coalesce(
+           unfold(),
+           addV('upi_id').property('value', 'scammer@ybl')
+       )
+       .property('last_seen', '2026-03-04T12:30:00Z')
+     ```
+   - This **atomic upsert** prevents the race condition where two concurrent workers both try to create the same vertex, which would produce duplicate nodes in the graph.
+   - After upserting the vertex, creates edges to the session vertex and other related entities.
    - Emits a SignalR transparency event for the dashboard graph visualization.
 5. The agent pipeline continues unblocked. Response latency improves significantly.
 
@@ -1360,8 +1522,9 @@ Result: Scammer reveals a second mule account (bank_account_2),
 **Matching algorithm:**
 
 When a new session reaches the group chat, the system:
-1. After receiving 3+ scammer messages, builds a preliminary fingerprint.
-2. Queries Azure AI Search with the `style_embedding` vector using cosine similarity.
+1. After receiving **3+ scammer messages**, builds a **preliminary script-sequence fingerprint** (script structure + timing only — enough for early pattern detection but not for confident matching).
+2. After receiving **6+ scammer messages**, generates the full **linguistic `style_embedding`** using Azure OpenAI `text-embedding-3-small`. This threshold ensures enough text signal for a reliable behavioural fingerprint. At 3 messages, many scammers look identical ("Hello" / "Send OTP" / "Send OTP quickly"), producing dangerous false positives.
+3. Queries Azure AI Search with the `style_embedding` vector using cosine similarity (only after the 6-message threshold is met).
 3. If the top match has similarity > 0.85:
    - Cross-validates by comparing `script_structure` sequence similarity (Levenshtein distance).
    - Cross-validates by comparing `timing_pattern` statistical overlap.
@@ -1542,9 +1705,27 @@ When a session ends (scammer stops responding, session times out, or manual term
     "confusion", "delay", "reverse_verification", "payment_failure_loop"
   ],
   
-  "risk_assessment": "HIGH — organized scam network with at least 2 mule accounts"
+  "risk_assessment": "HIGH — organized scam network with at least 2 mule accounts",
+  
+  "event_timeline": [
+    {"timestamp": "2026-03-04T12:01:15Z", "event": "session_created", "detail": "Sentinel classified as UPI Fraud (0.93)"},
+    {"timestamp": "2026-03-04T12:01:18Z", "event": "persona_assigned", "detail": "rajesh-mehta-01"},
+    {"timestamp": "2026-03-04T12:02:05Z", "event": "entity_extracted", "detail": "phone: +919876543210"},
+    {"timestamp": "2026-03-04T12:04:32Z", "event": "entity_extracted", "detail": "upi_id: scammer@ybl"},
+    {"timestamp": "2026-03-04T12:05:10Z", "event": "sandbox_triggered", "detail": "URL: secure-sbi-update.com"},
+    {"timestamp": "2026-03-04T12:05:18Z", "event": "sandbox_complete", "detail": "Phishing confirmed. Fields: PAN, OTP"},
+    {"timestamp": "2026-03-04T12:12:45Z", "event": "tactic_deployed", "detail": "reverse_verification"},
+    {"timestamp": "2026-03-04T12:15:20Z", "event": "entity_extracted", "detail": "bank_account: XXXX123456, IFSC: AXIS0001234"},
+    {"timestamp": "2026-03-04T12:22:00Z", "event": "tactic_deployed", "detail": "payment_failure_loop (attempt 1)"},
+    {"timestamp": "2026-03-04T12:28:30Z", "event": "entity_extracted", "detail": "second_mule: fraud2@paytm"},
+    {"timestamp": "2026-03-04T12:35:00Z", "event": "fingerprint_match", "detail": "Similarity 0.91, Campaign: Electricity Bill Scam"},
+    {"timestamp": "2026-03-04T12:47:15Z", "event": "session_dormant", "detail": "No response for 30 minutes"},
+    {"timestamp": "2026-03-04T16:47:15Z", "event": "session_terminated", "detail": "Dormant timeout (4 hours)"}
+  ]
 }
 ```
+
+**Why a timeline matters:** Law enforcement agencies strongly prefer chronological event timelines over flat data dumps. The timeline shows exactly what happened, when it happened, and in what order — critical for building legal cases and correlating events across multiple reports.
 
 **Storage:** JSON report → Blob Storage (`evidence-reports`). Optionally rendered to PDF for law-enforcement readability.
 
@@ -1646,6 +1827,26 @@ The system maintains a **static database of 50+ pre-generated persona JSON objec
 1. **Scam type:** An SBI-themed scam gets an SBI-customer persona. A tech-support scam gets a persona with low tech literacy.
 2. **Language:** A Tamil-language scam gets a Tamil-speaking persona from Chennai or Madurai.
 3. **Recency:** Personas recently used are deprioritized to avoid the same persona appearing across concurrent sessions.
+4. **Fingerprint-based blacklist:** If the incoming scammer matches a known fingerprint (from §9.2), the system queries the history for that fingerprint and **excludes any persona_id previously used** against that scammer. This prevents the same scammer from encountering the same victim persona on a return engagement, which would immediately raise suspicion.
+
+```python
+def select_persona(scam_type: str, language: str, fingerprint_match: dict | None) -> Persona:
+    candidates = persona_pool.filter(scam_type=scam_type, language=language)
+    
+    # Exclude recently used personas (across all sessions in last 24h)
+    recent_ids = get_recently_used_persona_ids(hours=24)
+    candidates = [p for p in candidates if p.persona_id not in recent_ids]
+    
+    # Exclude personas previously shown to this scammer (by fingerprint)
+    if fingerprint_match and fingerprint_match.matched:
+        blacklisted_ids = get_personas_used_against_fingerprint(
+            fingerprint_match.fingerprint_id
+        )
+        candidates = [p for p in candidates if p.persona_id not in blacklisted_ids]
+    
+    # Select from remaining candidates (weighted random by match quality)
+    return random.choice(candidates)
+```
 
 All 50+ persona JSON objects are stored in Azure AI Search (`persona-memory` index) and cached in Cosmos DB at session start.
 
@@ -1676,25 +1877,33 @@ Base delays depend on message complexity:
 
 ### 11.4 Dynamic Calculation with Agent Pipeline Latency
 
-The agent pipeline (Intelligence Agent analysis → Strategy Engine → Deception Agent generation → tool calls) already introduces latency. The system calculates the **remaining delay** to apply:
+The agent pipeline (Intelligence Agent analysis → Strategy Engine → Deception Agent generation → tool calls) already introduces latency. The latency simulation system calculates the **remaining delay** to apply, **if any**:
+
+> **⚠️ CRITICAL DESIGN RULE: Artificial delay is ONLY added when the pipeline is faster than the target human delay.** If the agent pipeline already took longer than the target delay (e.g., due to LLM cold-starts, sandbox analysis, or network issues), **no additional artificial delay is added whatsoever.** The system never compounds latency on top of already-slow responses. The goal is to simulate human timing, not to add arbitrary delays. If reality is already slow enough to look human, the system sends the response immediately.
 
 ```python
 def calculate_response_delay(response_type, pipeline_start_time):
-    """Calculate how much artificial delay to add."""
+    """Calculate how much artificial delay to add, if any."""
     target_delay = get_target_delay(response_type)  # e.g., 6.0 seconds
     
     elapsed = time.time() - pipeline_start_time  # e.g., 3.2 seconds already spent
     
-    remaining_delay = max(0, target_delay - elapsed)
+    if elapsed >= target_delay:
+        # Pipeline already exceeded target — send immediately, no artificial delay
+        log.info(f"Pipeline latency ({elapsed:.1f}s) >= target ({target_delay:.1f}s). "
+                 f"Skipping artificial delay.")
+        return 0.0
+    
+    remaining_delay = target_delay - elapsed
     
     # Add random jitter (±20%) for naturalness
     jitter = remaining_delay * random.uniform(-0.2, 0.2)
-    final_delay = remaining_delay + jitter
+    final_delay = max(0, remaining_delay + jitter)
     
-    return max(0, final_delay)  # Never negative
+    return final_delay
 ```
 
-**Key insight:** If the agent pipeline takes 5 seconds (e.g., due to a SandboxBrowserTool call), and the target delay is 6 seconds, only 1 second of artificial delay is added. If the pipeline already exceeded the target, no delay is added. This prevents overly long total response times while still appearing human.
+**Key insight:** If the agent pipeline takes 5 seconds (e.g., due to a SandboxBrowserTool call), and the target delay is 6 seconds, only 1 second of artificial delay is added. If the pipeline takes 7 seconds, **zero** artificial delay is added — the response is sent immediately because it already looks human-paced. This rule applies everywhere in the system where latency simulation is referenced: multi-part responses (§11.5), typing indicators (§11.6), and the stalling messages in §7.2.
 
 ### 11.5 Advanced: Multi-Part Response Simulation
 
@@ -1972,20 +2181,25 @@ class SessionLock:
 ### 13.3 Full Message Processing Flow with Lock
 
 ```
-1. Message arrives from Service Bus accumulator
+1. Message arrives from Service Bus accumulator (or sandbox callback webhook)
 2. Acquire Redis lock for session_id
    - If lock fails after 10 retries: message goes to retry queue
-3. Load session state from Cosmos DB
+3. Restore GroupChat via 3-tier persistence (§7.2: RAM → Redis → Cosmos DB)
 4. Route to appropriate handler (Sentinel or GroupChat)
 5. Agent reasoning cycle executes
-6. All state updates committed atomically:
-   - Session state (Cosmos DB)
-   - Intelligence graph (Cosmos DB)
-   - Transparency events (Cosmos DB)
-   - Fingerprint updates (AI Search)
-7. Response sent to scammer
-8. Release Redis lock
+6. State updates:
+   a. Persist GroupChat state (RAM + Redis sync, Cosmos DB async)
+   b. Session state update (Cosmos DB)
+   c. Intelligence graph update (async via Service Bus → Gremlin worker)
+   d. Transparency events (Cosmos DB)
+   e. Fingerprint updates (AI Search, only after 6+ messages)
+7. Calculate latency delay (only if pipeline was faster than target)
+8. Response sent to scammer (with typing indicator + delay)
+9. Schedule nudge messages via Service Bus (§19.1)
+10. Release Redis lock
 ```
+
+**Note:** Sandbox callbacks (from async URL analysis) follow the exact same flow starting at step 1. They must acquire the Redis lock before injecting results to prevent concurrency conflicts with incoming scammer messages (see §8.1 Async Callback Concurrency Trap).
 
 ---
 
@@ -2393,21 +2607,92 @@ Session States:
   terminated → Session is permanently closed. Evidence report generated.
 ```
 
-**Active → Dormant transition (nudge sequence):**
-- After 10 minutes of silence: send a "nudge" message as the persona ("Hello? Aap wahan hain? Main wait kar raha hoon.").
-- After 20 minutes: send a second nudge ("Maine aapko call kiya par nahi laga. Kya main baad mein try karun?").
-- After 30 minutes: session transitions to `dormant` state. **Session is NOT terminated.** Redis lock is released. Agent resources are freed. Session state is fully persisted in Cosmos DB.
+**Active → Dormant transition (nudge sequence via Service Bus Scheduled Messages):**
+
+Azure Container Apps are stateless and scale to zero. There is no active thread sitting around counting to 10 minutes for each session. Instead, the nudge mechanism uses **Azure Service Bus scheduled messages** — messages with a deferred delivery time.
+
+**How it works:**
+
+At the end of every conversation turn (Step 8 in §13.3), the system enqueues **three scheduled messages** to a `nudge-queue`:
+
+```python
+async def schedule_nudges(session_id: str, current_turn_count: int):
+    """Schedule nudge messages at conversation turn completion."""
+    now = datetime.utcnow()
+    
+    # Nudge 1: 10 minutes from now
+    await service_bus_client.send_message(
+        ServiceBusMessage(
+            body=json.dumps({
+                "session_id": session_id,
+                "nudge_type": "first",
+                "expected_turn_count": current_turn_count  # Stale check
+            }),
+            scheduled_enqueue_time_utc=now + timedelta(minutes=10)
+        ),
+        queue_name="nudge-queue"
+    )
+    
+    # Nudge 2: 20 minutes from now
+    await service_bus_client.send_message(
+        ServiceBusMessage(
+            body=json.dumps({
+                "session_id": session_id,
+                "nudge_type": "second",
+                "expected_turn_count": current_turn_count
+            }),
+            scheduled_enqueue_time_utc=now + timedelta(minutes=20)
+        ),
+        queue_name="nudge-queue"
+    )
+    
+    # Dormant transition: 30 minutes from now
+    await service_bus_client.send_message(
+        ServiceBusMessage(
+            body=json.dumps({
+                "session_id": session_id,
+                "nudge_type": "dormant_transition",
+                "expected_turn_count": current_turn_count
+            }),
+            scheduled_enqueue_time_utc=now + timedelta(minutes=30)
+        ),
+        queue_name="nudge-queue"
+    )
+```
+
+**When a scheduled message pops** (10/20/30 minutes later), a worker checks if the session's `turn_count` has changed:
+
+```python
+async def handle_nudge(message: ServiceBusMessage):
+    payload = json.loads(message.body)
+    session = await cosmos_client.read_item(payload["session_id"])
+    
+    if session.turn_count > payload["expected_turn_count"]:
+        # Scammer replied in the meantime — drop the nudge silently
+        return
+    
+    if payload["nudge_type"] == "first":
+        await send_persona_message(session, "Hello? Aap wahan hain? Main wait kar raha hoon.")
+    elif payload["nudge_type"] == "second":
+        await send_persona_message(session, "Maine aapko call kiya par nahi laga. Kya main baad mein try karun?")
+    elif payload["nudge_type"] == "dormant_transition":
+        session.status = "dormant"
+        session.save()  # Redis lock released, agent resources freed
+```
+
+**Why Service Bus scheduled messages:** They are fully managed, survive container restarts, cost nothing when idle, and require zero background threads or timers. Each conversation turn simply enqueues 3 cheap scheduled messages. If the scammer replies before the nudge fires, the worker discards it based on the `turn_count` check.
 
 **Dormant → Active recovery:**
 If the scammer replies after going dormant (even hours later), the system:
 1. Detects the incoming message belongs to a `dormant` session (Cosmos DB lookup).
 2. Acquires Redis lock.
 3. Transitions session back to `active`.
-4. Loads the **compressed context summary** from Cosmos DB and prepends it to the agent context.
+4. Restores GroupChat via the 3-tier persistence model (§7.2) and prepends the compressed context summary.
 5. Resumes the AutoGen GroupChat with full strategic continuity.
 6. The Deception Agent naturally explains the gap: "Sorry, mera phone band ho gaya tha. Kya hua? Batayiye."
 
 **Dormant → Terminated transition:**
+- A **4-hour dormant expiry** scheduled message is also enqueued at the same time.
 - After **4 hours** in dormant state with no scammer reply: session automatically transitions to `terminated`.
 - Evidence Report is generated at this point.
 - Session state is archived to Blob Storage (`archived-sessions` container).
